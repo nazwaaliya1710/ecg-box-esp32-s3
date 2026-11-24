@@ -1,0 +1,253 @@
+const ECG_CFG = Object.freeze({
+  UPLOAD_TOKEN: 'ECGBOX',
+  ROOT_FOLDER: 'ECG BOX - Cloud Records',
+  SPREADSHEET: 'ECG BOX | Master Riwayat Benchmark',
+  TIMEZONE: 'Asia/Jakarta'
+});
+
+const MASTER_HEADERS = [
+  'Kunci unik', 'Waktu upload (WIB)', 'Sesi #', 'Nama pasien', 'Usia (tahun)',
+  'Jenis kelamin biologis', 'Aktivitas sebelum rekam', 'Label kondisi',
+  'BPM rata-rata', 'BPM minimum', 'BPM maksimum', 'BPM median',
+  'Total QRS', 'RR rata-rata (ms)', 'SDNN (ms)', 'RMSSD (ms)', 'CV RR (%)',
+  'Interval valid', 'Sampel valid / 12000', 'Folder Drive', 'Rekaman ECG CSV', 'Analisis Gemini'
+];
+const INTERVAL_HEADERS = [
+  'Waktu upload (WIB)', 'Kunci unik', 'Sesi #', 'Nama pasien', 'Aktivitas',
+  'Rentang waktu', 'Cakupan RR (ms)', 'BPM rata-rata', 'Status'
+];
+const LABELS = ['Tanpa label', 'Duduk tenang', 'Berdiri', 'Setelah aktivitas', 'Pemulihan', 'Kabel bergerak'];
+const SEX_LABEL = {male: 'Laki-laki', female: 'Perempuan', '': 'Tidak dicantumkan'};
+const ACTIVITY_LABEL = {rest: 'Istirahat', walking: 'Setelah berjalan', exercise: 'Setelah olahraga', other: 'Lainnya / tidak diketahui'};
+
+function doGet() {
+  return json_({ok: true, service: 'ECG BOX Cloud Upload', report_layout: 'ecgbox.print.v2', message: 'Use POST JSON from ESP32.'});
+}
+function doPost(e) {
+  let lock;
+  try {
+    if (!e || !e.postData || !e.postData.contents) throw Error('Body POST tidak tersedia.');
+    const data = JSON.parse(e.postData.contents);
+    if (data.token !== ECG_CFG.UPLOAD_TOKEN) throw Error('Token upload tidak cocok.');
+    validate_(data);
+    if (data.report_layout !== 'ecgbox.print.v2') throw Error('Versi firmware/dashboard belum sesuai layout cetak. Upload firmware terbaru lalu Ctrl+F5.');
+    validatePrintPdf_(data.print_pdf);
+    lock = LockService.getScriptLock();
+    lock.waitLock(25000);
+    return json_(saveEcg_(data));
+  } catch (err) {
+    return json_({ok: false, error: String(err && err.message ? err.message : err).slice(0, 350)});
+  } finally {
+    if (lock) try { lock.releaseLock(); } catch (_) {}
+  }
+}
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+function validate_(p) {
+  if (p.schema !== 'ecgbox.v1') throw Error('Versi payload tidak didukung.');
+  if (!p.id || !/^[a-zA-Z0-9:._-]{3,100}$/.test(String(p.key))) throw Error('Kunci sesi tidak valid.');
+  if (!p.patient || !String(p.patient.name || '').trim()) throw Error('Nama pasien wajib diisi.');
+  if (!(Number(p.patient.age) >= 1 && Number(p.patient.age) <= 120)) throw Error('Usia tidak valid.');
+  if (!Object.prototype.hasOwnProperty.call(SEX_LABEL, String(p.patient.sex || ''))) throw Error('Sex tidak valid.');
+  if (!Object.prototype.hasOwnProperty.call(ACTIVITY_LABEL, String(p.patient.activity || ''))) throw Error('Aktivitas tidak valid.');
+  if (!Array.isArray(p.rows) || p.rows.length !== 6) throw Error('Harus ada 6 interval 10 detik.');
+  if (Number(p.fs) !== 200 || Number(p.samples) !== 12000 || p.encoding !== 'u16le-base64') throw Error('Format sampel tidak sesuai.');
+  if (typeof p.raw !== 'string' || p.raw.length < 30000 || p.raw.length > 35000) throw Error('Data 60 detik tidak lengkap.');
+}
+function folder_() {
+  const props = PropertiesService.getScriptProperties();
+  const oldId = props.getProperty('ECG_BOX_FOLDER_ID');
+  if (oldId) try { return DriveApp.getFolderById(oldId); } catch (_) {}
+  const folders = DriveApp.getFoldersByName(ECG_CFG.ROOT_FOLDER);
+  const f = folders.hasNext() ? folders.next() : DriveApp.createFolder(ECG_CFG.ROOT_FOLDER);
+  props.setProperty('ECG_BOX_FOLDER_ID', f.getId());
+  return f;
+}
+function spreadsheet_(folder) {
+  const props = PropertiesService.getScriptProperties();
+  const oldId = props.getProperty('ECG_BOX_SHEET_ID');
+  if (oldId) try { return SpreadsheetApp.openById(oldId); } catch (_) {}
+  const ss = SpreadsheetApp.create(ECG_CFG.SPREADSHEET);
+  const main = ss.getSheets()[0]; main.setName('RIWAYAT');
+  ss.insertSheet('INTERVAL_10S');
+  ss.insertSheet('PETUNJUK');
+  const info = ss.getSheetByName('PETUNJUK');
+  info.getRange('A1:B7').setValues([
+    ['ECG BOX', 'RIWAYAT ECG BERBASIS ESP32-S3'],
+    ['Sheet RIWAYAT', 'Satu baris untuk setiap pemeriksaan ECG 60 detik'],
+    ['Sheet INTERVAL_10S', 'Enam baris BPM 10-detik untuk setiap sesi'],
+    ['Data gelombang', 'File CSV berisi 12.000 sampel di Google Drive'],
+    ['Waktu', 'Kolom waktu mencatat saat upload, bukan saat pengukuran'],
+    ['Interpretasi', 'Data prototipe pendidikan; bukan pengganti diagnosis medis'],
+    ['Catatan', 'Data tersimpan secara privat pada akun yang men-deploy script']
+  ]);
+  info.setColumnWidths(1, 1, 195); info.setColumnWidths(2, 1, 600);
+  info.setFrozenRows(1); info.getRange('A1:B1').setBackground('#244734').setFontColor('#FFFFFF').setFontWeight('bold');
+  info.getRange('A2:B7').setBackground('#EEF6EF').setWrap(true);
+  info.setRowHeights(1, 7, 36); info.setHiddenGridlines(true); info.setTabColor('#A8C9AB');
+  for (const [name, heads, color] of [
+    ['RIWAYAT', MASTER_HEADERS, '#1E764D'],
+    ['INTERVAL_10S', INTERVAL_HEADERS, '#2B78C5']
+  ]) {
+    const sh = ss.getSheetByName(name);
+    sh.getRange(1, 1, 1, heads.length).setValues([heads]);
+    styleSheet_(sh, heads.length, color);
+  }
+  DriveApp.getFileById(ss.getId()).moveTo(folder);
+  props.setProperty('ECG_BOX_SHEET_ID', ss.getId());
+  return ss;
+}
+function styleSheet_(sheet, count, tab) {
+  sheet.setHiddenGridlines(true); sheet.setFrozenRows(1); sheet.setFrozenColumns(Math.min(4, count)); sheet.setTabColor(tab);
+  const head = sheet.getRange(1, 1, 1, count);
+  head.setBackground('#244734').setFontColor('#FFFFFF').setFontWeight('bold')
+      .setFontSize(10).setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+  sheet.setRowHeight(1, 54);
+  sheet.setColumnWidths(1, count, 150);
+  const widths = count === MASTER_HEADERS.length
+    ? [225, 178, 74, 195, 96, 170, 175, 155, 125, 110, 115, 115, 90, 145, 120, 120, 98, 110, 150, 140, 145, 145]
+    : [178, 225, 74, 190, 185, 135, 145, 145, 110];
+  widths.forEach((w, i) => sheet.setColumnWidth(i + 1, w));
+}
+function safe_(value) {
+  const s = String(value == null ? '' : value).slice(0, 150);
+  return /^[=+@-]/.test(s) ? "'" + s : s;
+}
+function drawRow_(sh, row, count) {
+  const area = sh.getRange(row, 1, 1, count);
+  area.setBackground(row % 2 ? '#FFFFFF' : '#EDF5EF');
+  area.setFontFamily('Arial').setFontColor('#203A2C').setFontSize(10).setVerticalAlignment('middle');
+  area.setWrap(false);
+  sh.setRowHeight(row, 35);
+  sh.getRange(row, 1, 1, 1).setFontColor('#557060').setFontSize(9);
+  // Filter diperbarui sekali setelah seluruh baris ditambahkan.
+}
+function finalizeTable_(sh, headers) {
+  const n = headers.length, last = Math.max(2, sh.getLastRow());
+  // Ukuran otomatis mengikuti isi, tetapi dibatasi agar tabel tetap terbaca di HP/laptop.
+  sh.autoResizeColumns(1, n);
+  for (let col = 1; col <= n; col++) {
+    const cap = col <= 4 ? 260 : (n === MASTER_HEADERS.length && col >= 20 ? 190 : 205);
+    const min = col === 3 ? 80 : 112;
+    sh.setColumnWidth(col, Math.min(cap, Math.max(min, sh.getColumnWidth(col))));
+  }
+  const filter = sh.getFilter();
+  if (filter) filter.remove();
+  sh.getRange(1, 1, last, n).createFilter();
+  const hdr = sh.getRange(1, 1, 1, n);
+  hdr.setWrap(true).setFontColor('#FFFFFF').setFontWeight('bold').setBackground('#244734').setVerticalAlignment('middle');
+}
+
+function saveEcg_(data) {
+  const root = folder_();
+  const ss = spreadsheet_(root);
+  const sh = ss.getSheetByName('RIWAYAT');
+  const last = sh.getLastRow();
+  if (last >= 2) {
+    const existing = sh.getRange(2, 1, last - 1, 1).getDisplayValues();
+    const idx = existing.findIndex(row => row[0] === data.key);
+    if (idx >= 0) {
+      const oldRow = idx + 2;
+      const pdfUrl = storePrintPdf_(DriveApp.getFolderById(String(sh.getRange(oldRow,20).getValue()).match(/folders\/([\w-]+)/)[1]), data.id, data.print_pdf);
+      linkReport_(sh, oldRow, pdfUrl);
+      return {
+        ok: true, report_layout: 'ecgbox.print.v2', duplicate: true, message: 'Sesi ini sudah tersimpan di Drive.',
+        sheet_url: ss.getUrl(), folder_url: String(sh.getRange(oldRow, 20).getValue()),
+        csv_url: String(sh.getRange(oldRow, 21).getValue()), pdf_url: pdfUrl
+      };
+    }
+  }
+  const bytes = Utilities.base64Decode(data.raw);
+  if (bytes.length !== 24000) throw Error('Ukuran rekaman harus 24.000 byte (12.000 × uint16).');
+  let valid = 0; const beats = []; const csv = new Array(12001);
+  csv[0] = 'waktu_ms,adc,qrs_terdeteksi';
+  for (let i = 0; i < 12000; i++) {
+    const word = (bytes[i * 2] & 255) | ((bytes[i * 2 + 1] & 255) << 8);
+    const missing = word === 65535;
+    if (!missing) valid++;
+    const peak = !missing && !!(word & 32768);
+    if (peak) beats.push(i * 5);
+    csv[i + 1] = (i * 5) + ',' + (missing ? '' : (word & 4095)) + ',' + (missing ? '' : (peak ? 1 : 0));
+  }
+  const rates = data.rows.filter(r => r.b !== null && r.b !== undefined && Number(r.ms) > 0);
+  const covered = rates.reduce((sum, r) => sum + Number(r.ms), 0);
+  const avg = covered ? rates.reduce((sum, r) => sum + Number(r.b) * Number(r.ms), 0) / covered : null;
+  const sorted = rates.map(r => Number(r.b)).sort((a,b) => a - b);
+  const median = sorted.length ? (sorted[Math.floor((sorted.length-1)/2)] + sorted[Math.floor(sorted.length/2)])/2 : null;
+  const intervals = beats.slice(1).map((beat, i) => beat - beats[i]).filter(ms => ms > 0);
+  const meanRR = intervals.length ? intervals.reduce((a,b) => a+b, 0)/intervals.length : null;
+  const sdnn = intervals.length > 1 ? Math.sqrt(intervals.reduce((s, ms) => s + Math.pow(ms-meanRR,2), 0)/(intervals.length-1)) : null;
+  const rmssd = intervals.length > 1 ? Math.sqrt(intervals.slice(1).reduce((s, ms, i) => s + Math.pow(ms-intervals[i],2),0)/(intervals.length-1)) : null;
+  const numeric = (v) => v == null || !isFinite(Number(v)) ? '' : Math.round(Number(v)*100)/100;
+  const min = sorted.length ? sorted[0] : null;
+  const max = sorted.length ? sorted[sorted.length-1] : null;
+  const timestamp = Utilities.formatDate(new Date(), ECG_CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss');
+  const safeFolder = String(data.patient.name).replace(/[\\/:*?"<>|\n\r]/g, '_').slice(0, 45);
+  const folder = root.createFolder(timestamp.replace(/[: ]/g,'_') + '_Sesi_' + data.id + '_' + safeFolder);
+  const csvFile = folder.createFile('ECG_Sesi_' + data.id + '_200Hz_60s.csv', csv.join('\n'), MimeType.CSV);
+  const details = {
+    schema:'ecgbox.v1', upload_time_wib: timestamp, device_id: data.device, session_id: data.id,
+    patient: data.patient, label: data.label, sample_rate_hz:200, duration_s:60,
+    sample_count:12000, valid_samples:valid, summary:{avg_bpm:avg,min_bpm:min,max_bpm:max,median_bpm:median,total_qrs:data.qrs,mean_rr_ms:meanRR,sdnn_ms:sdnn,rmssd_ms:rmssd,cv_percent:meanRR ? 100*sdnn/meanRR : null},
+    intervals_10s: data.rows
+  };
+  folder.createFile('Metadata_Sesi_' + data.id + '.json', JSON.stringify(details, null, 2), MimeType.PLAIN_TEXT);
+  let aiUrl = '';
+  if (typeof data.ai === 'string' && data.ai.trim()) {
+    const aiFile = folder.createFile('Analisis_Gemini_Sesi_' + data.id + '.txt', data.ai.slice(0,16000), MimeType.PLAIN_TEXT);
+    aiUrl = aiFile.getUrl();
+  }
+  const masterRow = [
+    data.key,timestamp,Number(data.id),safe_(data.patient.name),Number(data.patient.age),SEX_LABEL[data.patient.sex || ''],
+    ACTIVITY_LABEL[data.patient.activity || ''],LABELS[Number(data.label)||0]||'Tanpa label',
+    numeric(avg),numeric(min),numeric(max),numeric(median),Number(data.qrs),numeric(meanRR),numeric(sdnn),numeric(rmssd),
+    numeric(meanRR && sdnn !== null ? 100*sdnn/meanRR : null),rates.length,valid,folder.getUrl(),csvFile.getUrl(),aiUrl
+  ];
+  const nextRow = sh.getLastRow()+1;
+  sh.getRange(nextRow, 1, 1, MASTER_HEADERS.length).setValues([masterRow]);
+  drawRow_(sh,nextRow,MASTER_HEADERS.length);
+  sh.getRange(nextRow, 9, 1, 4).setNumberFormat('0.00');
+  sh.getRange(nextRow, 14, 1, 4).setNumberFormat('0.00');
+  sh.getRange(nextRow, 20, 1, 3).setFontColor('#1167A8').setFontLine('underline');
+  if (rates.length < 6) sh.getRange(nextRow,18).setBackground('#FFF0C9').setFontColor('#8C590D');
+  const intervalSh = ss.getSheetByName('INTERVAL_10S');
+  data.rows.forEach((r,i) => {
+    const row=intervalSh.getLastRow()+1;
+    intervalSh.getRange(row,1,1,INTERVAL_HEADERS.length).setValues([[
+      timestamp,data.key,Number(data.id),safe_(data.patient.name),ACTIVITY_LABEL[data.patient.activity || ''],
+      (i*10)+'–'+((i+1)*10)+' detik',Number(r.ms)||0,r.b==null?'':numeric(r.b),r.b==null?'Data kurang':'Valid'
+    ]]);
+    drawRow_(intervalSh,row,INTERVAL_HEADERS.length);
+    intervalSh.getRange(row,8).setNumberFormat('0.00');
+    if(r.b==null)intervalSh.getRange(row,9).setBackground('#FBE4DF').setFontColor('#9A3729');
+  });
+  finalizeTable_(sh, MASTER_HEADERS);
+  finalizeTable_(intervalSh, INTERVAL_HEADERS);
+  SpreadsheetApp.flush();
+  const pdfUrl = storePrintPdf_(folder, data.id, data.print_pdf);
+  linkReport_(sh, nextRow, pdfUrl);
+  return {ok:true,report_layout:'ecgbox.print.v2',pdf_url:pdfUrl,duplicate:false,message:'Rekaman ECG berhasil disimpan ke Google Drive dan Sheets.',folder_url:folder.getUrl(),csv_url:csvFile.getUrl(),sheet_url:ss.getUrl()};
+}
+
+function linkReport_(sh,row,url) {
+  sh.getRange(1,23).setValue('Laporan PDF').setBackground('#244734').setFontColor('#FFFFFF').setFontWeight('bold').setWrap(true);
+  sh.getRange(row,23).setValue(url).setFontColor('#1167A8').setFontLine('underline');
+  sh.setColumnWidth(23,190);
+}
+
+function validatePrintPdf_(encoded) {
+  if (typeof encoded !== 'string' || encoded.length < 100 || encoded.length > 2000000 || encoded.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) throw Error('PDF cetak belum tersedia atau tidak valid. Gunakan firmware/dashboard terbaru.');
+  const bytes=Utilities.base64Decode(encoded);
+  if (bytes.slice(0,5).map(b=>String.fromCharCode(b & 255)).join('') !== '%PDF-') throw Error('File laporan bukan PDF.');
+  return bytes;
+}
+function storePrintPdf_(folder, id, encoded) {
+  const bytes=validatePrintPdf_(encoded),name='Laporan_ECG_Sesi_'+id+'.pdf';
+  // Create first; only replace prior PDFs after the new file succeeds.
+  const old=[],files=folder.getFilesByName(name);
+  while(files.hasNext())old.push(files.next());
+  const pdf=folder.createFile(Utilities.newBlob(bytes,MimeType.PDF,name));
+  old.forEach(f=>{try{f.setTrashed(true);}catch(_){}});
+  return pdf.getUrl();
+}
